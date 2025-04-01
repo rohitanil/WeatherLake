@@ -1,0 +1,134 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+      POSTGRES_DB: metastore
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "iceberg"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # MinIO setup helper to create the required bucket
+  minio-setup:
+    image: minio/mc
+    container_name: minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc config host add myminio http://minio:9000 admin password;
+      /usr/bin/mc mb myminio/warehouse;
+      exit 0;
+      "
+
+  kafka:
+    image: bitnami/kafka:3.5.0
+    container_name: kafka
+    environment:
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      ALLOW_PLAINTEXT_LISTENER: yes
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_LOG_DIRS: /tmp/kraft-combined-logs
+    ports:
+      - "9092:9092"
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg-rest
+    environment:
+      STORAGE_CONFIG: |-
+        {
+          "warehouse": "s3://warehouse/",
+          "s3": {
+            "endpoint": "http://minio:9000",
+            "access-key-id": "admin",
+            "secret-access-key": "password",
+            "path-style-access": true
+          }
+        }
+      METASTORE_CONFIG: |-
+        {
+          "type": "jdbc",
+          "jdbc": {
+            "uri": "jdbc:postgresql://postgres:5432/metastore",
+            "user": "iceberg",
+            "password": "iceberg"
+          }
+        }
+    ports:
+      - "8181:8181"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+
+  trino:
+    image: trinodb/trino:latest
+    container_name: trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino-config:/etc/trino
+    depends_on:
+      - iceberg-rest
+      - postgres
+
+
+  spark:
+    image: tabulario/spark-iceberg
+    container_name: spark
+    build: spark/
+    depends_on:
+      - iceberg-rest
+      - minio
+    volumes:
+      - ./warehouse:/home/iceberg/warehouse
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    ports:
+      - 8888:8888
+      - 8082:8082
+      - 10000:10000
+      - 10001:10001
+
+volumes:
+  postgres-data:
+  minio-data:
